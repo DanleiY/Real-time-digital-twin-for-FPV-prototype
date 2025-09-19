@@ -1,0 +1,174 @@
+using System;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Collections.Concurrent;
+using UnityEngine;
+
+public class UnityFPVReceiver : MonoBehaviour
+{
+    [Header("Network")]
+    public string host = "127.0.0.1";
+    public int port = 5005;
+
+    [Header("Pose Freeze & Zeroing")]
+    public bool freezeInitialPose = true;
+    public bool zeroOnFirstPacket = true;
+
+    [Header("Axes Mapping (local)")]
+    public Vector3 heaveAxisLocal = Vector3.up;
+    public Vector3 surgeAxisLocal = Vector3.right;
+    public Vector3 pitchAxisLocal = Vector3.forward;
+
+    [Header("Scales")]
+    public float heaveScale = 1f;
+    public float surgeScale = 1f;
+    public float pitchScale = 1f;
+
+    [Header("Smoothing (optional)")]
+    [Range(0f, 1f)] public float positionLerp = 0.25f;
+    [Range(0f, 1f)] public float rotationLerp = 0.25f;
+
+    [Header("Debug")]
+    public bool logConnection = true;
+    public bool logJson = false;
+
+    private TcpClient _client;
+    private Thread _thread;
+    private volatile bool _running;
+    private readonly ConcurrentQueue<RigidMsg> _queue = new ConcurrentQueue<RigidMsg>();
+
+    private Vector3 _baseWorldPos;
+    private Quaternion _baseWorldRot;
+
+    private bool _hasZero;
+    private float _h0, _s0, _p0;
+
+    private Vector3 _targetPos;
+    private Quaternion _targetRot;
+
+    [Serializable]
+    private class RigidMsg
+    {
+        public float heave;
+        public float surge;
+        public float pitch_deg;
+        public double t;
+    }
+
+    private void Start()
+    {
+        if (freezeInitialPose)
+        {
+            _baseWorldPos = transform.position;
+            _baseWorldRot = transform.rotation;
+        }
+        else
+        {
+            _baseWorldPos = transform.position;
+            _baseWorldRot = transform.rotation;
+        }
+
+        _targetPos = _baseWorldPos;
+        _targetRot = _baseWorldRot;
+
+        _running = true;
+        _thread = new Thread(NetLoop) { IsBackground = true };
+        _thread.Start();
+    }
+
+    private void OnDestroy()
+    {
+        _running = false;
+        try { _client?.Close(); } catch { }
+        try { _thread?.Join(200); } catch { }
+    }
+
+    private void Update()
+    {
+        RigidMsg last = null;
+        while (_queue.TryDequeue(out var m)) last = m;
+        if (last != null)
+        {
+            if (zeroOnFirstPacket && !_hasZero)
+            {
+                _h0 = last.heave; _s0 = last.surge; _p0 = last.pitch_deg;
+                _hasZero = true;
+            }
+
+            float dh = last.heave - (_hasZero ? _h0 : 0f);
+            float ds = last.surge - (_hasZero ? _s0 : 0f);
+            float dp = last.pitch_deg - (_hasZero ? _p0 : 0f);
+
+            Vector3 heaveDirWorld = _baseWorldRot * heaveAxisLocal.normalized;
+            Vector3 surgeDirWorld = _baseWorldRot * surgeAxisLocal.normalized;
+            Vector3 posTarget = _baseWorldPos + heaveDirWorld * (heaveScale * dh) + surgeDirWorld * (surgeScale * ds);
+
+            Quaternion rotOffset = Quaternion.AngleAxis(pitchScale * dp, _baseWorldRot * pitchAxisLocal.normalized);
+            Quaternion rotTarget = rotOffset * _baseWorldRot;
+
+            _targetPos = Vector3.Lerp(_targetPos, posTarget, positionLerp <= 0f ? 1f : positionLerp);
+            _targetRot = Quaternion.Slerp(_targetRot, rotTarget, rotationLerp <= 0f ? 1f : rotationLerp);
+        }
+
+        transform.position = _targetPos;
+        transform.rotation = _targetRot;
+    }
+
+    private void NetLoop()
+    {
+        while (_running)
+        {
+            try
+            {
+                _client = new TcpClient();
+                _client.Connect(host, port);
+                if (logConnection) Debug.Log($"[UnityFPVReceiver] Connected to {host}:{port}");
+
+                using (var stream = _client.GetStream())
+                {
+                    byte[] buf = new byte[8192];
+                    var sb = new StringBuilder();
+                    while (_running && _client.Connected)
+                    {
+                        if (!stream.DataAvailable)
+                        {
+                            Thread.Sleep(1);
+                            continue;
+                        }
+                        int n = stream.Read(buf, 0, buf.Length);
+                        if (n <= 0) break;
+                        sb.Append(Encoding.UTF8.GetString(buf, 0, n));
+
+                        int nl;
+                        while ((nl = sb.ToString().IndexOf('\n')) >= 0)
+                        {
+                            string line = sb.ToString(0, nl).Trim();
+                            sb.Remove(0, nl + 1);
+                            if (line.Length == 0) continue;
+                            if (logJson) Debug.Log(line);
+                            try
+                            {
+                                var msg = JsonUtility.FromJson<RigidMsg>(line);
+                                if (msg != null) _queue.Enqueue(msg);
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.LogWarning($"[UnityFPVReceiver] JSON parse error: {ex.Message}\nLine: {line}");
+                            }
+                        }
+                    }
+                }
+
+                if (logConnection) Debug.Log("[UnityFPVReceiver] Disconnected. Retrying in 1s...");
+                Thread.Sleep(1000);
+            }
+            catch (Exception ex)
+            {
+                if (logConnection) Debug.LogWarning($"[UnityFPVReceiver] {ex.GetType().Name}: {ex.Message}. Retry in 1s...");
+                try { _client?.Close(); } catch { }
+                Thread.Sleep(1000);
+            }
+        }
+    }
+}
