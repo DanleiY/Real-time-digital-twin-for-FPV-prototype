@@ -1,0 +1,722 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import sys, asyncio
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+    try:
+        from bleak.backends.winrt.util import allow_sta
+        allow_sta()
+    except Exception:
+        pass
+
+import struct, time, socket, json, threading, math
+from collections import deque
+import numpy as np
+import pandas as pd
+from joblib import load
+import matplotlib.pyplot as plt
+from bleak import BleakClient
+import csv
+from datetime import datetime
+from queue import Queue
+
+MAIN_LOOP = None
+
+BLE_ADDRESS_A = "FD:A1:C6:52:2A:2E"
+BLE_ADDRESS_B = "ED:D0:41:0A:28:BA"
+
+UNITY_HOST = "127.0.0.1"
+UNITY_PORT = 5005
+
+PLOT_ENABLE = True
+WINDOW_SECONDS = 30.0
+PLOT_REDRAW_EVERY_N = 4
+FORECAST_DOT = True
+FORECAST_HORIZON_S = 0.1
+
+FIX_YLIMS = True
+YLIM_HEAVE = (-0.1, 0.1)
+YLIM_SURGE = (-0.1, 0.1)
+YLIM_PITCH = (-7.0, 7.0)
+
+USE_BLIT = True
+
+MOTION_PARAMS = dict(
+    g=9.8,
+    acc_hp_cut_hz=0.05,
+    acc_lp_cut_hz=5.0,
+    vel_hp_cut_hz=0.08,
+    pos_hp_cut_hz=0.02,
+    acc_deadband=0.02,
+    zupt_acc_th=0.06,
+    zupt_gyr_th=2.0,
+    zupt_window=10,
+    fs_assumed=50.0
+)
+
+LOG_ENABLE = True
+LOG_FLUSH_EVERY = 1.0
+loggers = {}
+
+AI_ENABLE = True
+AI_MODEL_PATH = "AI_F1_best_model.joblib"
+AI_MAX_FPS = 8
+MANUAL_LIGHT_ANGLE = 45.0
+MANUAL_FREQUENCY_HZ = 0.72
+MANUAL_AMPLITUDE_M  = 0.025
+MANUAL_LEFT_SOLAR   = float("nan")
+MANUAL_MIDDLE_SOLAR = float("nan")
+MANUAL_RIGHT_SOLAR  = float("nan")
+
+class UnityBridge:
+    def __init__(self, host=UNITY_HOST, port=UNITY_PORT):
+        self.host = host
+        self.port = port
+        self.conn = None
+        self.thread = None
+    def start(self):
+        self.thread = threading.Thread(target=self._listen, daemon=True)
+        self.thread.start()
+    def _listen(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((self.host, self.port))
+            s.listen()
+            print(f"✅ UnityBridge listening on {self.host}:{self.port} ...")
+            self.conn, addr = s.accept()
+            print(f"✅ Unity connected: {addr}")
+    def send(self, data: dict):
+        if self.conn:
+            try:
+                self.conn.sendall((json.dumps(data) + "\n").encode("utf-8"))
+            except Exception as e:
+                print("⚠️ Send failed:", e)
+
+def wrap180(deg):
+    return (deg + 180.0) % 360.0 - 180.0
+
+def euler_deg_to_dcm(roll, pitch, yaw):
+    r = math.radians(roll)
+    p = math.radians(pitch)
+    y = math.radians(yaw)
+    cr, sr = math.cos(r), math.sin(r)
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+    return [
+        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+        [  -sp,             cp*sr,             cp*cr]
+    ]
+
+def mat_vec(R, v):
+    return [R[0][0]*v[0]+R[0][1]*v[1]+R[0][2]*v[2],
+            R[1][0]*v[0]+R[1][1]*v[1]+R[1][2]*v[2],
+            R[2][0]*v[0]+R[2][1]*v[1]+R[2][2]*v[2]]
+
+class OnePoleLPF:
+    def __init__(self, cutoff_hz: float):
+        self.cut = max(0.0, float(cutoff_hz))
+        self.y = None
+    def reset(self, value: float = 0.0):
+        self.y = value
+    def update(self, x: float, dt: float) -> float:
+        if self.cut <= 0:
+            return x
+        if self.y is None:
+            self.y = x
+            return x
+        alpha = 1.0 - math.exp(-2.0*math.pi*self.cut*dt)
+        self.y += alpha*(x - self.y)
+        return self.y
+
+class OnePoleHPF:
+    def __init__(self, cutoff_hz: float):
+        self.cut = max(0.0, float(cutoff_hz))
+        self.y = 0.0
+        self.x_prev = None
+    def reset(self):
+        self.y = 0.0
+        self.x_prev = None
+    def update(self, x: float, dt: float) -> float:
+        if self.cut <= 0:
+            return x
+        RC = 1.0/(2.0*math.pi*self.cut)
+        a = RC/(RC + dt)
+        if self.x_prev is None:
+            self.x_prev = x
+            self.y = 0.0
+            return 0.0
+        y = a*(self.y + x - self.x_prev)
+        self.x_prev = x
+        self.y = y
+        return y
+
+FRAME_HEADER = 0x55
+FRAME_ID_ANGLES = 0x61
+FRAME_SIZE = 20
+
+def decode_wt901_stream(buf: bytes):
+    i = 0
+    L = len(buf)
+    while i <= L - FRAME_SIZE:
+        if buf[i] == FRAME_HEADER and buf[i+1] == FRAME_ID_ANGLES:
+            frame = buf[i:i+FRAME_SIZE]
+            try:
+                ax = struct.unpack('<h', frame[2:4])[0] / 32768 * 16 * 9.8
+                ay = struct.unpack('<h', frame[4:6])[0] / 32768 * 16 * 9.8
+                az = struct.unpack('<h', frame[6:8])[0] / 32768 * 16 * 9.8
+                wx = struct.unpack('<h', frame[8:10])[0] / 32768 * 2000
+                wy = struct.unpack('<h', frame[10:12])[0] / 32768 * 2000
+                wz = struct.unpack('<h', frame[12:14])[0] / 32768 * 2000
+                roll  = struct.unpack('<h', frame[14:16])[0] / 32768 * 180
+                pitch = struct.unpack('<h', frame[16:18])[0] / 32768 * 180
+                yaw   = struct.unpack('<h', frame[18:20])[0] / 32768 * 180
+                yield {
+                    "ax": ax, "ay": ay, "az": az,
+                    "wx": wx, "wy": wy, "wz": wz,
+                    "roll": roll, "pitch": pitch, "yaw": yaw,
+                    "timestamp": time.time()
+                }
+            except Exception:
+                pass
+            i += FRAME_SIZE
+        else:
+            i += 1
+
+class MotionAnalyzer:
+    def __init__(self, **kwargs):
+        self.g = kwargs.get("g", 9.8)
+        self.hpf_ax = OnePoleHPF(kwargs.get("acc_hp_cut_hz", 0.05))
+        self.hpf_az = OnePoleHPF(kwargs.get("acc_hp_cut_hz", 0.05))
+        self.lpf_ax = OnePoleLPF(kwargs.get("acc_lp_cut_hz", 5.0))
+        self.lpf_az = OnePoleLPF(kwargs.get("acc_lp_cut_hz", 5.0))
+        self.hpf_vx = OnePoleHPF(kwargs.get("vel_hp_cut_hz", 0.08))
+        self.hpf_vz = OnePoleHPF(kwargs.get("vel_hp_cut_hz", 0.08))
+        self.hpf_x  = OnePoleHPF(kwargs.get("pos_hp_cut_hz", 0.02))
+        self.hpf_z  = OnePoleHPF(kwargs.get("pos_hp_cut_hz", 0.02))
+        self.acc_deadband = kwargs.get("acc_deadband", 0.02)
+        self.zupt_acc_th  = kwargs.get("zupt_acc_th", 0.06)
+        self.zupt_gyr_th  = kwargs.get("zupt_gyr_th", 2.0)
+        self.zupt_window  = max(1, kwargs.get("zupt_window", 10))
+        self.fs_assumed   = kwargs.get("fs_assumed", 50.0)
+        self.ax_prev_f = None
+        self.az_prev_f = None
+        self.vx = 0.0
+        self.vz = 0.0
+        self.x  = 0.0
+        self.z  = 0.0
+        self._zupt_cnt = 0
+        self._pitch0 = None
+        self._t_prev = None
+
+    @staticmethod
+    def _deadband(x: float, d: float) -> float:
+        return 0.0 if abs(x) < d else x
+
+    def _dt(self, t_now: float) -> float:
+        if self._t_prev is None:
+            self._t_prev = t_now
+            return 1.0/self.fs_assumed
+        dt = max(1e-4, min(0.2, t_now - self._t_prev))
+        self._t_prev = t_now
+        return dt
+
+    def reset(self):
+        self.hpf_ax.reset()
+        self.hpf_az.reset()
+        self.lpf_ax.reset(0.0)
+        self.lpf_az.reset(0.0)
+        self.hpf_vx.reset()
+        self.hpf_vz.reset()
+        self.hpf_x.reset()
+        self.hpf_z.reset()
+        self.ax_prev_f = None
+        self.az_prev_f = None
+        self.vx = self.vz = 0.0
+        self.x = self.z = 0.0
+        self._zupt_cnt = 0
+        self._pitch0 = None
+        self._t_prev = None
+
+    def step(self, sample: dict):
+        ax, ay, az = sample["ax"], sample["ay"], sample["az"]
+        wx, wy, wz = sample["wx"], sample["wy"], sample["wz"]
+        roll, pitch, yaw = sample["roll"], sample["pitch"], sample["yaw"]
+        t = sample["timestamp"]
+        dt = self._dt(t)
+
+        R_wb = euler_deg_to_dcm(roll, pitch, yaw)
+        R_bw = [[R_wb[j][i] for j in range(3)] for i in range(3)]
+        g_body = mat_vec(R_bw, [0.0, 0.0, -self.g])
+        ax_lin_b = ax - g_body[0]
+        ay_lin_b = ay - g_body[1]
+        az_lin_b = az - g_body[2]
+        ax_lin_w, _, az_lin_w = mat_vec(R_wb, [ax_lin_b, ay_lin_b, az_lin_b])
+
+        ax_bp = self.lpf_ax.update(self.hpf_ax.update(ax_lin_w, dt), dt)
+        az_bp = self.lpf_az.update(self.hpf_az.update(az_lin_w, dt), dt)
+        ax_bp = self._deadband(ax_bp, self.acc_deadband)
+        az_bp = self._deadband(az_bp, self.acc_deadband)
+
+        a_norm = math.sqrt(ax_bp*ax_bp + az_bp*az_bp)
+        w_norm = math.sqrt(wx*wx + wy*wy + wz*wz)
+        stat_inst = (a_norm < self.zupt_acc_th) and (w_norm < self.zupt_gyr_th)
+        self._zupt_cnt = min(self._zupt_cnt + 1, self.zupt_window) if stat_inst else 0
+        is_stationary = (self._zupt_cnt >= self.zupt_window)
+
+        if self.ax_prev_f is None:
+            self.ax_prev_f = ax_bp
+            self.az_prev_f = az_bp
+            vx_new = self.vx
+            vz_new = self.vz
+        else:
+            vx_new = self.vx + 0.5*(self.ax_prev_f + ax_bp)*dt
+            vz_new = self.vz + 0.5*(self.az_prev_f + az_bp)*dt
+            self.ax_prev_f, self.az_prev_f = ax_bp, az_bp
+
+        vx_hp = self.hpf_vx.update(vx_new, dt)
+        vz_hp = self.hpf_vz.update(vz_new, dt)
+
+        if is_stationary:
+            self.hpf_vx.reset()
+            self.hpf_vz.reset()
+            self.hpf_x.reset()
+            self.hpf_z.reset()
+            self.vx = self.vz = 0.0
+        else:
+            self.vx, self.vz = vx_hp, vz_hp
+            x_new = self.x + self.vx*dt
+            z_new = self.z + self.vz*dt
+            self.x = self.hpf_x.update(x_new, dt)
+            self.z = self.hpf_z.update(z_new, dt)
+
+        if self._pitch0 is None:
+            self._pitch0 = pitch
+        pitch_out = wrap180(pitch - self._pitch0)
+
+        heave = self.z
+        surge = self.x
+        return heave, surge, pitch_out
+
+class TwoSensorAverager:
+    def __init__(self):
+        self.latest = {'A': None, 'B': None}
+        self.cb = None
+    def register_callback(self, fn):
+        self.cb = fn
+    def ingest_single_result(self, tag, heave, surge, pitch_deg, t):
+        self.latest[tag] = {"heave": heave, "surge": surge, "pitch_deg": pitch_deg, "t": t}
+        self._try_emit()
+    def _try_emit(self):
+        A, B = self.latest['A'], self.latest['B']
+        if A is None or B is None:
+            return
+        heave = 0.5*(A["heave"] + B["heave"])
+        surge = 0.5*(A["surge"] + B["surge"])
+        pitch = 0.5*(A["pitch_deg"] + B["pitch_deg"])
+        out = {"heave": heave, "surge": surge, "pitch_deg": pitch, "t": max(A["t"], B["t"])}
+        if self.cb:
+            self.cb(out)
+
+class AsyncCSVLogger:
+    def __init__(self, csv_path: str, header):
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        self.csv_path = csv_path
+        self.header = list(header)
+        self.q = Queue(maxsize=10000)
+        self._stop = False
+        self._last_flush = time.time()
+        self._fh = open(self.csv_path, "w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fh, fieldnames=self.header)
+        self._writer.writeheader()
+        threading.Thread(target=self._loop, daemon=True).start()
+    def _loop(self):
+        while not self._stop or not self.q.empty():
+            try:
+                row = self.q.get(timeout=0.2)
+                self._writer.writerow(row)
+                if time.time() - self._last_flush >= LOG_FLUSH_EVERY:
+                    self._fh.flush()
+                    self._last_flush = time.time()
+            except Exception:
+                pass
+        try:
+            self._fh.flush()
+        except Exception:
+            pass
+    def push(self, row: dict):
+        if not self._stop:
+            try:
+                self.q.put_nowait(row)
+            except Exception:
+                pass
+    def close(self):
+        self._stop = True
+
+CHAR_UUID_NOTIFY = "0000ffe4-0000-1000-8000-00805f9a34fb"
+CHAR_UUID_WRITE  = "0000ffe9-0000-1000-8000-00805f9a34fb"
+
+class SingleIMUReader:
+    def __init__(self, address: str, tag: str, analyzer: MotionAnalyzer, up: TwoSensorAverager):
+        self.address = address
+        self.tag = tag
+        self.an = analyzer
+        self.up = up
+    def _notify(self, sender, data: bytearray):
+        for sample in decode_wt901_stream(bytes(data)):
+            if LOG_ENABLE:
+                lg = loggers.get(f"raw_{self.tag}")
+                if lg:
+                    lg.push({
+                        "t": sample["timestamp"],
+                        "ax": sample["ax"], "ay": sample["ay"], "az": sample["az"],
+                        "wx": sample["wx"], "wy": sample["wy"], "wz": sample["wz"],
+                        "roll": sample["roll"], "pitch": sample["pitch"], "yaw": sample["yaw"],
+                    })
+            heave, surge, pitch = self.an.step(sample)
+            if LOG_ENABLE:
+                lg2 = loggers.get(f"res_{self.tag}")
+                if lg2:
+                    lg2.push({"t": sample["timestamp"], "heave": heave, "surge": surge, "pitch_deg": pitch})
+            self.up.ingest_single_result(self.tag, heave, surge, pitch, sample["timestamp"])
+    async def run(self, runtime_sec=1000):
+        async with BleakClient(self.address) as client:
+            print(f"🔗 Connecting WT901 ({self.tag}) ...")
+            cmds = [
+                bytearray([0xFF, 0xAA, 0x69, 0xB5]),
+                bytearray([0xFF, 0xAA, 0x27, 0x0D]),
+                bytearray([0xFF, 0xAA, 0x03, 0x0A]),
+                bytearray([0xFF, 0xAA, 0x00, 0x00])
+            ]
+            for cmd in cmds:
+                try:
+                    await client.write_gatt_char(CHAR_UUID_WRITE, cmd)
+                    await asyncio.sleep(1.0)
+                except Exception as e:
+                    print(f"⚠️ Init command failed ({self.tag}):", e)
+            await client.start_notify(CHAR_UUID_NOTIFY, self._notify)
+            print(f"📡 ({self.tag}) Listening for sensor data ...")
+            await asyncio.sleep(runtime_sec)
+            await client.stop_notify(CHAR_UUID_NOTIFY)
+            print(f"🔌 ({self.tag}) Listener stopped")
+
+class F1Model:
+    FEAT_COLS = [
+        "Time_sec","Light_Angle","Frequency_Hz","Amplitude_m",
+        "Left_Solar_Irradiance_(W_m2)","Middle_Solar_Irradiance_(W_m2)","Right_Solar_Irradiance_(W_m2)",
+        "AngleZ____1","Surge_cm","Heave_cm"
+    ]
+    TARGETS = ["Pactual_W","Force1_N","Force2_N","TempOfMiddleOfPVPanelAve__C_"]
+    def __init__(self, model_path: str):
+        self.model = load(model_path)
+        try:
+            self.model.named_steps["model"].set_params(verbose=0)
+            est = self.model.named_steps["model"]
+            if hasattr(est, "n_jobs"):
+                est.n_jobs = 1
+            if hasattr(est, "set_params"):
+                est.set_params(n_jobs=1, verbose=0)
+            for sub in getattr(est, "estimators_", []):
+                if hasattr(sub, "set_params"):
+                    sub.set_params(n_jobs=1, verbose=0)
+        except Exception:
+            pass
+        self.t0 = time.time()
+    def predict(self, pitch_deg, surge_m, heave_m,
+                light_angle=MANUAL_LIGHT_ANGLE, freq=MANUAL_FREQUENCY_HZ, amp=MANUAL_AMPLITUDE_M,
+                left=MANUAL_LEFT_SOLAR, mid=MANUAL_MIDDLE_SOLAR, right=MANUAL_RIGHT_SOLAR):
+        tsec = time.time() - self.t0
+        row = [tsec, light_angle, freq, amp, left, mid, right,
+               float(pitch_deg), float(surge_m)*100.0, float(heave_m)*100.0]
+        X = pd.DataFrame([row], columns=self.FEAT_COLS)
+        y = self.model.predict(X)[0]
+        return {k: float(v) for k, v in zip(self.TARGETS, y)}
+
+class AsyncPredictor:
+    def __init__(self, f1_model, on_result, max_fps=8):
+        self.f1 = f1_model
+        self.on_result = on_result
+        self.q = Queue(maxsize=1)
+        self.min_dt = 1.0/max(1,int(max_fps))
+        self._last = 0.0
+        self._stop = False
+        threading.Thread(target=self._loop, daemon=True).start()
+    def submit(self, rigid):
+        now = time.time()
+        if now - self._last < self.min_dt:
+            return
+        self._last = now
+        try:
+            while True:
+                self.q.get_nowait()
+        except Exception:
+            pass
+        try:
+            self.q.put_nowait(rigid)
+        except Exception:
+            pass
+    def _loop(self):
+        while not self._stop:
+            rigid = self.q.get()
+            try:
+                preds = self.f1.predict(rigid["pitch_deg"], rigid["surge"], rigid["heave"])
+                self.on_result(preds)
+            except Exception:
+                pass
+    def stop(self):
+        self._stop = True
+
+class SmoothVisualizer:
+    def __init__(self, window_s=WINDOW_SECONDS, use_blit=USE_BLIT, redraw_every=PLOT_REDRAW_EVERY_N):
+        import numpy as np, matplotlib.pyplot as plt
+        from collections import deque
+        import time
+        self.window_s = float(window_s)
+        self.use_blit = bool(use_blit)
+        self.redraw_every = max(1, int(redraw_every))
+        self._i = 0
+        self.t = deque()
+        self.heave = deque()
+        self.surge = deque()
+        self.pitch = deque()
+        plt.ion()
+        self.fig = plt.figure(figsize=(12, 7))
+        gs = self.fig.add_gridspec(4, 1, height_ratios=[1, 1, 1, 1.2])
+        self.axes = [self.fig.add_subplot(gs[i, 0]) for i in range(3)]
+        titles = ["Heave (m)", "Surge (m)", "Pitch (deg)"]
+        self.lines, self.pred_dots = [], []
+        for ax, title in zip(self.axes, titles):
+            ax.set_title(title)
+            ax.grid(True, linewidth=0.5)
+            (line,) = ax.plot([], [], lw=1.2, animated=True)
+            (dot,)  = ax.plot([], [], 'o', ms=7, mfc='none', mec='r', mew=1.4, animated=True)
+            self.lines.append(line)
+            self.pred_dots.append(dot)
+        if FIX_YLIMS:
+            self.axes[0].set_ylim(*YLIM_HEAVE)
+            self.axes[1].set_ylim(*YLIM_SURGE)
+            self.axes[2].set_ylim(*YLIM_PITCH)
+        for ax in self.axes:
+            ax.set_xlim(-self.window_s, 0.3)
+        self.panel_ax = self.fig.add_subplot(gs[3, 0])
+        self.panel_ax.axis('off')
+        self.panel_ax.set_xlim(0, 1)
+        self.panel_ax.set_ylim(0, 1)
+        self._labels, self._values = {}, {}
+        mapping = {
+            "Pactual_W": ("Power Output (W)", (0.06, 0.78), (0.35, 0.78)),
+            "Force1_N": ("Mooring Force Downstream (N)", (0.06, 0.42), (0.35, 0.42)),
+            "Force2_N": ("Mooring Force Upstream (N)", (0.54, 0.78), (0.83, 0.78)),
+            "TempOfMiddleOfPVPanelAve__C_": ("Temperature of PV panel (°C)", (0.54, 0.42), (0.83, 0.42)),
+        }
+        for key, (label, (lx, ly), (vx, vy)) in mapping.items():
+            self._labels[key] = self.panel_ax.text(
+                lx, ly, label + ":", fontsize=11, ha='left', va='center', alpha=0.95
+            )
+            self._values[key] = self.panel_ax.text(
+                vx, vy, "--", fontsize=18, fontweight='bold', ha='left', va='center',
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.8", alpha=0.95),
+                animated=True
+            )
+        self.fig.canvas.draw()
+        self._cache_backgrounds()
+        self.cid_resize = self.fig.canvas.mpl_connect('resize_event', self._on_resize)
+        self._frame_i = 0
+        self._autoscale_every_n = 20
+        self.fig.subplots_adjust(hspace=0.5)
+
+    def _cache_backgrounds(self):
+        canvas = self.fig.canvas
+        self._bgs = [canvas.copy_from_bbox(ax.bbox) for ax in self.axes + [self.panel_ax]]
+
+    def _on_resize(self, _evt):
+        self.fig.canvas.draw()
+        self._cache_backgrounds()
+
+    @staticmethod
+    def _predict_next(ts, ys, horizon=FORECAST_HORIZON_S):
+        if len(ts) < 2:
+            return None
+        t2, t1 = float(ts[-1]), float(ts[-2])
+        y2, y1 = float(ys[-1]), float(ys[-2])
+        dt = max(1e-4, t2 - t1)
+        return (float(horizon), y2 + (y2 - y1) * (float(horizon) / dt))
+
+    @staticmethod
+    def _fmt(v):
+        import numpy as np
+        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+            return "--"
+        return f"{v:,.1f}"
+
+    def update_panel(self, preds):
+        if not preds:
+            return
+        for k in ["Pactual_W", "Force1_N", "Force2_N", "TempOfMiddleOfPVPanelAve__C_"]:
+            if k in self._values:
+                self._values[k].set_text(self._fmt(preds.get(k, None)))
+
+    def update(self, rigid: dict, preds: dict | None):
+        import numpy as np
+        t = float(rigid["t"])
+        self.t.append(t)
+        self.heave.append(float(rigid["heave"]))
+        self.surge.append(float(rigid["surge"]))
+        self.pitch.append(float(rigid["pitch_deg"]))
+        t0 = t - self.window_s
+        while self.t and self.t[0] < t0:
+            self.t.popleft()
+            self.heave.popleft()
+            self.surge.popleft()
+            self.pitch.popleft()
+        self.update_panel(preds)
+        self._i += 1
+        if self._i % self.redraw_every != 0:
+            return
+        ts = np.asarray(self.t, dtype=float)
+        x_rel = ts - ts[-1]
+        for line, data in zip(self.lines, (self.heave, self.surge, self.pitch)):
+            y = np.fromiter((v for v in data), dtype=float, count=len(data))
+            line.set_data(x_rel, y)
+        if FORECAST_DOT:
+            for dot, data in zip(self.pred_dots, (self.heave, self.surge, self.pitch)):
+                res = self._predict_next(ts, data, horizon=FORECAST_HORIZON_S)
+                if res is None:
+                    dot.set_data([], [])
+                else:
+                    xr, yr = res
+                    dot.set_data([xr], [yr])
+        self._frame_i += 1
+        if not FIX_YLIMS and (self._frame_i % self._autoscale_every_n == 0):
+            for ax in self.axes:
+                ax.relim()
+                ax.autoscale_view()
+            self.fig.canvas.draw()
+            self._cache_backgrounds()
+        if self.use_blit:
+            canvas = self.fig.canvas
+            for i, ax in enumerate(self.axes):
+                canvas.restore_region(self._bgs[i])
+                ax.draw_artist(self.lines[i])
+                ax.draw_artist(self.pred_dots[i])
+                canvas.blit(ax.bbox)
+            panel_bg = self._bgs[-1]
+            canvas.restore_region(panel_bg)
+            for v in self._values.values():
+                self.panel_ax.draw_artist(v)
+            canvas.blit(self.panel_ax.bbox)
+            canvas.flush_events()
+        else:
+            self.fig.canvas.draw_idle()
+            plt.pause(0.001)
+
+async def _gui_pump_task():
+    try:
+        while True:
+            plt.pause(0.001)
+            await asyncio.sleep(0.05)
+    except asyncio.CancelledError:
+        pass
+
+if __name__ == "__main__":
+    unity = UnityBridge()
+    unity.start()
+
+    vis = SmoothVisualizer() if PLOT_ENABLE else None
+
+    analyzer_A = MotionAnalyzer(**MOTION_PARAMS)
+    analyzer_B = MotionAnalyzer(**MOTION_PARAMS)
+
+    aver = TwoSensorAverager()
+
+    LATEST_PREDS = None
+
+    def _set_latest_from_thread(p):
+        global LATEST_PREDS
+        LATEST_PREDS = p
+
+    def on_pred_ready(preds: dict):
+        if MAIN_LOOP is not None:
+            MAIN_LOOP.call_soon_threadsafe(_set_latest_from_thread, preds)
+        else:
+            _set_latest_from_thread(preds)
+
+    f1 = None
+    predictor = None
+    if AI_ENABLE:
+        try:
+            f1 = F1Model(AI_MODEL_PATH)
+            predictor = AsyncPredictor(f1, on_result=on_pred_ready, max_fps=AI_MAX_FPS)
+            print(f"🤖 AI model loaded: {AI_MODEL_PATH}")
+        except Exception as e:
+            print("⚠️ Failed to load AI model:", e)
+            f1 = None
+            predictor = None
+
+    def on_averaged(rigid: dict):
+        if predictor is not None:
+            predictor.submit(rigid)
+        if vis is not None:
+            vis.update(rigid, LATEST_PREDS)
+        if LOG_ENABLE and "avg" in loggers:
+            row = {
+                "t": rigid["t"],
+                "heave": rigid["heave"],
+                "surge": rigid["surge"],
+                "pitch_deg": rigid["pitch_deg"]
+            }
+            if LATEST_PREDS:
+                row.update({
+                    "Pactual_W": LATEST_PREDS.get("Pactual_W"),
+                    "Force1_N": LATEST_PREDS.get("Force1_N"),
+                    "Force2_N": LATEST_PREDS.get("Force2_N"),
+                    "TempMidC": LATEST_PREDS.get("TempOfMiddleOfPVPanelAve__C_")
+                })
+            loggers["avg"].push(row)
+        unity.send(rigid)
+
+    aver.register_callback(on_averaged)
+
+    imuA = SingleIMUReader(BLE_ADDRESS_A, "A", analyzer_A, aver)
+    imuB = SingleIMUReader(BLE_ADDRESS_B, "B", analyzer_B, aver)
+
+    if LOG_ENABLE:
+        ts_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join("logs", f"FPV_{ts_dir}")
+        loggers["raw_A"] = AsyncCSVLogger(os.path.join(base, "raw_A.csv"),
+            header=["t","ax","ay","az","wx","wy","wz","roll","pitch","yaw"])
+        loggers["raw_B"] = AsyncCSVLogger(os.path.join(base, "raw_B.csv"),
+            header=["t","ax","ay","az","wx","wy","wz","roll","pitch","yaw"])
+        loggers["res_A"] = AsyncCSVLogger(os.path.join(base, "result_A.csv"),
+            header=["t","heave","surge","pitch_deg"])
+        loggers["res_B"] = AsyncCSVLogger(os.path.join(base, "result_B.csv"),
+            header=["t","heave","surge","pitch_deg"])
+        loggers["avg"] = AsyncCSVLogger(os.path.join(base, "averaged.csv"),
+            header=["t","heave","surge","pitch_deg","Pactual_W","Force1_N","Force2_N","TempMidC"])
+        print(f"🧾 Log directory: {base}")
+
+    async def main():
+        global MAIN_LOOP
+        MAIN_LOOP = asyncio.get_running_loop()
+        gui_task = asyncio.create_task(_gui_pump_task())
+        await asyncio.gather(imuA.run(runtime_sec=1000), imuB.run(runtime_sec=1000))
+        gui_task.cancel()
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("👋 Interrupt received, exiting...")
+    finally:
+        if LOG_ENABLE:
+            for k, lg in list(loggers.items()):
+                try:
+                    lg.close()
+                except Exception:
+                    pass
+        print("👋 Exited.")
