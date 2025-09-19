@@ -1,3 +1,5 @@
 # The Python script is the main code. It connects to WT901 sensors via BLE, decodes motion data, applies filtering and drift suppression, and performs dual-sensor fusion. It also logs data, provides real-time visualisation, and streams synchronised motion to Unity over TCP. In addition, pre-trained machine learning models can be loaded for real-time prediction of power, temperature, and mooring forces.
 
 # The C# script is the Unity control code, designed to be used within a Unity project. It receives JSON data streams from the Python server and maps them onto the 3D FPV model, ensuring the virtual animation follows the physical prototype in real time.
+
+# The demo video "FPV digital twin 90.mp4" can be downloaded. 
